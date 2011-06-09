@@ -38,35 +38,32 @@
  */
 package org.netbeans.modules.scala.editor
 
-import javax.lang.model.element.{ExecutableElement}
-import javax.swing.text.{BadLocationException}
+import javax.lang.model.element.ExecutableElement
+import javax.swing.text.BadLocationException
 import org.netbeans.api.java.source.ClassIndex
 import org.netbeans.api.java.source.ClassIndex.NameKind
 import org.netbeans.api.lexer.{Token, TokenHierarchy, TokenId, TokenSequence}
 import org.netbeans.editor.{BaseDocument, Utilities}
 import org.netbeans.modules.csl.api.CodeCompletionHandler.QueryType
-import org.netbeans.modules.csl.api.{CodeCompletionHandler, CompletionProposal, OffsetRange}
+import org.netbeans.modules.csl.api.{CodeCompletionHandler, CompletionProposal}
 import org.netbeans.modules.csl.spi.{DefaultCompletionResult, ParserResult}
 import org.netbeans.modules.parsing.spi.indexing.support.QuerySupport
-import org.openide.filesystems.FileObject
-import org.openide.util.{Exceptions}
+import org.openide.util.Exceptions
 
-import org.netbeans.api.language.util.ast.{AstItem}
 import org.netbeans.modules.scala.core.ScalaParserResult
 import org.netbeans.modules.scala.core.ScalaSourceUtil
 import org.netbeans.modules.scala.core.ScalaSymbolResolver
 import org.netbeans.modules.scala.core.lexer.{ScalaLexUtil, ScalaTokenId}
 import org.netbeans.modules.scala.core.ScalaGlobal
-import org.netbeans.modules.scala.core.ScalaParser.Sanitize
 import org.netbeans.modules.scala.core.rats.ParserScala
 
-import scala.concurrent.SyncVar
-import scala.tools.nsc.symtab.Flags
-import scala.tools.nsc.util.OffsetPosition
-
 /**
+ *
  * @author Caoyuan Deng
  * 
+ * It seems CompleteHandle will always be called before other csl features (semantic, structure etc)
+ * that's good. But then, we may need to make sure the prResult had been reset first and 
+ * go to semantic analysis when root is required.
  */
 object ScalaCodeCompleter {
   // Dbl-space lines to keep formatter from collapsing pairs into a block
@@ -170,9 +167,11 @@ object ScalaCodeCompleter {
   var callMethod: ExecutableElement = _
 }
 
-class ScalaCodeCompleter(val global: ScalaGlobal) {
-  import ScalaCodeCompleter._
-
+import ScalaCodeCompleter._
+class ScalaCodeCompleter(val pResult: ScalaParserResult) {
+  val global = pResult.global
+  val th = pResult.getSnapshot.getTokenHierarchy
+  
   import global._
 
   private object completionProposals extends {
@@ -187,16 +186,13 @@ class ScalaCodeCompleter(val global: ScalaGlobal) {
 
   var caseSensitive: Boolean = _
   var completionResult: DefaultCompletionResult = _
-  var th: TokenHierarchy[_] = _
   var anchor: Int = _
   var lexOffset: Int = _
   var astOffset: Int = _
   var doc: BaseDocument = _
   var prefix: String = _
   var kind: QuerySupport.Kind = _
-  var pResult: ScalaParserResult = _
   var queryType: QueryType = _
-  var fileObject: FileObject = _
   var fqn: String = _
   //var index: ScalaIndex = _
 
@@ -282,7 +278,7 @@ class ScalaCodeCompleter(val global: ScalaGlobal) {
   }
 
 
-  def completeKeywords(proposals: java.util.List[CompletionProposal]): Unit = {
+  def completeKeywords(proposals: java.util.List[CompletionProposal]) {
     // No keywords possible in the RHS of a call (except for "this"?)
     //        if (request.call.getLhs() != null) {
     //            return;
@@ -482,16 +478,6 @@ class ScalaCodeCompleter(val global: ScalaGlobal) {
         astOffset - (lexOffset - newLexOffset)
       } else astOffset
 
-      val range = pResult.sanitizedRange
-      if (range != OffsetRange.NONE && range.containsInclusive(astOffset1)) {
-        if (astOffset1 != range.getStart) {
-          astOffset1 = range.getStart - 1
-          if (astOffset1 < 0) {
-            astOffset1 = 0
-          }
-        }
-      }
-
       val ts = ScalaLexUtil.getTokenSequence(th, lexOffset).getOrElse(return false)
       ts.move(lexOffset)
       if (!ts.moveNext && !ts.movePrevious) {
@@ -536,16 +522,6 @@ class ScalaCodeCompleter(val global: ScalaGlobal) {
       //                }
       //            }
 
-      var haveSanitizedComma = (pResult.getSanitized == Sanitize.EDITED_DOT ||
-                                pResult.getSanitized == Sanitize.ERROR_DOT)
-      if (haveSanitizedComma) {
-        // We only care about removed commas since that
-        // affects the parameter count
-        if (pResult.sanitizedContents.indexOf(',') == -1) {
-          haveSanitizedComma = false
-        }
-      }
-
       if (call == null) {
         // Find the call in around the caret. Beware of
         // input sanitization which could have completely
@@ -565,24 +541,6 @@ class ScalaCodeCompleter(val global: ScalaGlobal) {
         //                    }
         //
         //                }
-      }
-
-      if (index != -1 && haveSanitizedComma && call != null) {
-        //                if (call.nodeId == NodeTypes.FCALLNODE) {
-        //                    an = ((FCallNode)call).getArgsNode();
-        //                } else if (call.nodeId == NodeTypes.CALLNODE) {
-        //                    an = ((CallNode)call).getArgsNode();
-        //                }
-        //                if (an != null && index < an.childNodes().size() &&
-        //                        ((Node)an.childNodes().get(index)).nodeId == NodeTypes.HASHNODE) {
-        //                    // We should stay within the hashnode, so counteract the
-        //                    // index++ which follows this if-block
-        //                    index--;
-        //                }
-
-        // Adjust the index to account for our removed
-        // comma
-        index += 1
       }
 
       if (call == null || index == -1) {
@@ -607,7 +565,6 @@ class ScalaCodeCompleter(val global: ScalaGlobal) {
 
       if (anchorOffset == -1) {
         anchorOffset = call.idToken.offset(th) // TODO - compute
-
       }
       anchorOffsetHolder(0) = anchorOffset
     } catch {
@@ -617,90 +574,62 @@ class ScalaCodeCompleter(val global: ScalaGlobal) {
     true
   }
 
-  def completeLocals(proposals: java.util.List[CompletionProposal]): Unit = {
-    val root = pResult.rootScope
-
+  def completeLocals(proposals: java.util.List[CompletionProposal]) {
+    //pResult.toTyped
+    
     val pos = rangePos(pResult.srcFile, lexOffset, lexOffset, lexOffset)
-
-    global.cancelSemantic(pos.source)
     val resp = new Response[List[Member]]
     try {
-      global.askScopeCompletion(pos, true, resp)
+      global.askScopeCompletion(pos, resp)
       resp.get match {
         case Left(members) =>
           for (ScopeMember(sym, tpe, accessible, viaImport) <- members
-               if accessible && startsWith(sym.nameString, prefix) && !sym.isConstructor
+               if startsWith(sym.nameString, prefix) && !sym.isConstructor
           ) {
-            createSymbolProposal(sym) foreach {proposals add _}
+            if (accessible) {
+              createSymbolProposal(sym) foreach {proposals add _}
+            }
           }
-        case Right(thr) => ScalaGlobal.resetLate(global, thr)
+        case Right(ex) => ScalaGlobal.resetLate(global, ex)
       }
-    } catch {case ex => ScalaGlobal.resetLate(global, ex)} // there is: scala.tools.nsc.FatalError: no context found for scala.tools.nsc.util.OffsetPosition@e302cef1
+    } catch {
+      case ex => ScalaGlobal.resetLate(global, ex) // there may be scala.tools.nsc.FatalError: no context found for scala.tools.nsc.util.OffsetPosition@e302cef1
+    } 
   }
 
   def completeSymbolMembers(baseToken: Token[TokenId], proposals: java.util.List[CompletionProposal]): Boolean = {
+    //pResult.toTyped
+    
+    val offset = baseToken.offset(th)
+    val endOffset = offset + baseToken.length - 1
+    val pos = rangePos(pResult.srcFile, offset, offset, endOffset)
+    val resp = new Response[List[Member]]
     try {
-      val offset = baseToken.offset(th)
-      val endOffset = offset + baseToken.length - 1
-      val pos = rangePos(pResult.srcFile, offset, offset, endOffset)
-
-      // * it seems CompleteHandle will always be called before other csl features (semantic, structure etc)
-      // * that's good. But then, we may need to reload source first:
-      global.cancelSemantic(pos.source)
-      val resp = new Response[List[Member]]
-      global.askTypeCompletion(pos, true, resp)
+      global.askTypeCompletion(pos, resp)
       resp.get match {
         case Left(members) =>
-          for (TypeMember(sym, tpe, accessible, inherited, viaView) <- members
-               if accessible && startsWith(sym.nameString, prefix) && !sym.isConstructor
+          for (TypeMember(sym, tpe, accessible, inherited, viaView) <- members 
+               if startsWith(sym.nameString, prefix) && !sym.isConstructor
           ) {
-            createSymbolProposal(sym) foreach {proposal =>
-              proposal.getElement.asInstanceOf[ScalaElement].isInherited = inherited
-              proposal.getElement.asInstanceOf[ScalaElement].isImplicit = (viaView != NoSymbol)
-              proposals.add(proposal)
+            if (accessible) {
+              createSymbolProposal(sym) foreach {proposal =>
+                proposal.getElement.asInstanceOf[ScalaElement].isInherited = inherited
+                proposal.getElement.asInstanceOf[ScalaElement].isImplicit = (viaView != NoSymbol)
+                proposals.add(proposal)
+              }
             }
           }
-        case Right(ex) => {ScalaGlobal.resetLate(global, ex)}
+        case Right(ex) => ScalaGlobal.resetLate(global, ex)
       }
-    } catch {case ex => ScalaGlobal.resetLate(global, ex)}
+    } catch {
+      case ex => ScalaGlobal.resetLate(global, ex)
+    }
 
     // always return true ?
     true
   }
 
-  @deprecated("For reference only")
-  def completeScopeImplicits(item: AstItem, proposals: java.util.List[CompletionProposal]): Boolean = {
-    val sym = item.symbol.asInstanceOf[Symbol]
-
-    // * use explict assigned `resultType` first
-    val resType = item.resultType match {
-      case null => getResultType(sym)
-      case x => x.asInstanceOf[Type]
-    }
-
-    if (resType == null) {
-      return false
-    }
-
-    val pos = new OffsetPosition(pResult.srcFile, item.idOffset(th))
-    try {
-      for (ScopeMember(sym, tpe, accessible, viaImport) <- global.scopeMembers(pos, true)
-           if sym.hasFlag(Flags.IMPLICIT) && tpe.paramTypes.size == 1 && tpe.paramTypes.head == resType;
-           member <- tpe.resultType.members 
-           if accessible && startsWith(member.nameString, prefix) && !member.isConstructor
-      ) {
-        createSymbolProposal(member) foreach {proposal =>
-          proposal.getElement.asInstanceOf[ScalaElement].isImplicit = true
-          proposals.add(proposal)
-        }
-      }
-      true
-    } catch {case ex => ScalaGlobal.resetLate(global, ex); false}
-  }
-
   private def createSymbolProposal(sym: Symbol): Option[CompletionProposal] = {
-    if (sym.hasFlag(Flags.PRIVATE)) return None
-
     var element: ScalaElement = null
     var proposal: CompletionProposal = null
     if (sym.isMethod) {

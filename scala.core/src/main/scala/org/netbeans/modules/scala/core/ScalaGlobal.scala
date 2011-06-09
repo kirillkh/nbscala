@@ -42,30 +42,49 @@ import java.io.{File, IOException}
 import java.net.{MalformedURLException, URISyntaxException, URL}
 import java.util.logging.{Logger, Level}
 import org.netbeans.api.java.classpath.ClassPath
-import org.netbeans.api.lexer.{TokenHierarchy}
 import org.netbeans.api.project.{FileOwnerQuery, Project, ProjectUtils}
 import org.netbeans.spi.java.queries.BinaryForSourceQueryImplementation
 import org.openide.filesystems.{FileChangeAdapter, FileEvent, FileObject, FileRenameEvent,
                                 FileStateInvalidException, FileUtil, JarFileSystem, FileChangeListener}
-import org.openide.util.{Exceptions, RequestProcessor, Utilities}
+import org.openide.modules.InstalledFileLocator
+import org.openide.util.{Exceptions, RequestProcessor}
 
 import org.netbeans.modules.scala.core.ast.{ScalaItems, ScalaDfns, ScalaRefs, ScalaRootScope, ScalaAstVisitor, ScalaUtils}
 import org.netbeans.modules.scala.core.element.{ScalaElements, JavaElements}
-
-import scala.collection.mutable.{ArrayBuffer, LinkedHashMap, WeakHashMap}
-
-import scala.tools.nsc.{Settings}
-
 import org.netbeans.modules.scala.core.interactive.Global
+
+import scala.collection.mutable.{ArrayBuffer, WeakHashMap}
+import scala.tools.nsc.Settings
 import scala.tools.nsc.io.AbstractFile
-import scala.tools.nsc.io.PlainFile
-import scala.tools.nsc.reporters.{Reporter}
+import scala.tools.nsc.reporters.Reporter
 import scala.tools.nsc.util.{Position, SourceFile}
 
 /**
  *
  * @author Caoyuan Deng
  */
+case class ScalaError(pos: Position, msg: String, severity: org.netbeans.modules.csl.api.Severity, force: Boolean)
+class ErrorReporter extends Reporter {
+  var errors: List[ScalaError] = Nil
+  
+  override def reset {
+    super.reset
+    errors = Nil
+  }
+  
+  def info0(pos: Position, msg: String, severity: Severity, force: Boolean) {
+    val sev = severity match {
+      case INFO => null
+      case WARNING => org.netbeans.modules.csl.api.Severity.WARNING
+      case ERROR => org.netbeans.modules.csl.api.Severity.ERROR
+      case _ => null
+    }
+    if (sev != null) {
+      errors ::= ScalaError(pos, msg, sev, force)
+    }
+  }
+}
+
 object ScalaGlobal {
 
   private val logger = Logger.getLogger(this.getClass.getName)
@@ -107,8 +126,6 @@ object ScalaGlobal {
   private var globalToListeners = Map[ScalaGlobal, List[FileChangeListener]]()
   private var globalForStdLib: Option[ScalaGlobal] = None
   private var toResetGlobals = Map[ScalaGlobal, Project]()
-
-  val dummyReporter = new Reporter {def info0(pos: Position, msg: String, severity: Severity, force: Boolean) {}}
 
   case class NormalReason(msg: String) extends Throwable(msg)
   object userRequest extends NormalReason("User's action")
@@ -210,7 +227,7 @@ object ScalaGlobal {
 
     None
   }
-
+  
   private def isForTest(resource: DirResource, fo: FileObject) = {
     // * is this `fo` under test source?
     resource.testToOut exists {case (src, _) => src.equals(fo) || FileUtil.isParentOf(src, fo)}
@@ -271,8 +288,8 @@ object ScalaGlobal {
       settings.verbose.value = false
     }
 
-    var bootCp = ClassPath.getClassPath(fo, ClassPath.BOOT)
-    var compCp = ClassPath.getClassPath(fo, ClassPath.COMPILE)
+    val bootCp = ClassPath.getClassPath(fo, ClassPath.BOOT)
+    val compCp = ClassPath.getClassPath(fo, ClassPath.COMPILE)
     val srcCp  = ClassPath.getClassPath(fo, ClassPath.SOURCE)
 
     val inStdLib =
@@ -286,16 +303,24 @@ object ScalaGlobal {
     
     val bootCpStr = toClassPathString(project, bootCp)
     settings.bootclasspath.value = bootCpStr
-    logger.info("project's bootclasspath: " + settings.bootclasspath.value)
+    logger.info("Project's bootclasspath: " + settings.bootclasspath.value)
 
     val compCpStr = toClassPathString(project, compCp)
     settings.classpath.value = compCpStr
-    logger.info("project's classpath: " + settings.classpath.value)
+    logger.info("Project's classpath: " + settings.classpath.value)
 
-    // * should set extdirs to empty, otherwise all jars under scala.home/lib will be added
-    // * which brings unwanted scala runtime (scala runtime should be set in compCpStr).
-    // * @see scala.tools.nsc.Settings#extdirsDefault
+    // Should set extdirs to empty, otherwise all jars under scala.home/lib will be added
+    // which brings unwanted scala runtime (scala runtime should be set in compCpStr).
+    // @see scala.tools.nsc.Settings#extdirsDefault
     settings.extdirs.value = ""
+    
+    // Should explictly set the pluginsDir, otherwise the default will be set to scala.home/misc
+    // which may bring uncompitable verions of scala's runtime call
+    // @see scala.tools.util.PathResolver.Defaults
+    val pluginJarsDir = InstalledFileLocator.getDefault.locate("modules/ext/org.scala-lang.plugins", "org.netbeans.libs.scala", false)
+    logger.info("Bundled plugin jars dir is: " + pluginJarsDir)
+    settings.pluginsDir.value = if (pluginJarsDir ne null) pluginJarsDir.getAbsolutePath else ""
+    settings.plugin.value = Nil
 
     // ----- set sourcepath, outpath
     
@@ -304,12 +329,12 @@ object ScalaGlobal {
     for ((src, out) <- if (forTest) resource.testSrcOutDirsPath else resource.srcOutDirsPath) {
       srcPaths ::= src
 
-      // * we only need one out path
+      // we only need one out path
       if (outPath == "") {
         outPath = out
 
-        // * Had out path dir been deleted? (a clean task etc), if so, create it, since scalac
-        // * can't parse anything correctly without an exist out dir (sounds a bit strange)
+        // Did out path dir be deleted? (a clean task etc), if so, create it, since scalac
+        // can't parse anything correctly without an exist out dir (sounds a bit strange)
         try {
           val file = new File(outPath)
           if (!file.exists) file.mkdirs
@@ -317,20 +342,20 @@ object ScalaGlobal {
       }
     }
 
-    // * @Note: do not add src path to global for test, since the corresponding build/classes has been added to compCp
+    // @Note: do not add src path to global for test, since the corresponding build/classes has been added to compCp
 
     settings.sourcepath.tryToSet(srcPaths.reverse)
     settings.outdir.value = outPath
 
-    logger.info("project's source paths set for global: " + srcPaths)
-    logger.info("project's output paths set for global: " + outPath)
+    logger.info("Project's source paths set for global: " + srcPaths)
+    logger.info("Project's output paths set for global: " + outPath)
     if (srcCp != null){
-      logger.info(srcCp.getRoots.mkString("project's srcCp: [", ", ", "]"))
+      logger.info(srcCp.getRoots.map(_.getPath).mkString("Project's srcCp: [", ", ", "]"))
     } else {
-      logger.info("project's srcCp is null !")
+      logger.info("Project's srcCp is null !")
     }
     
-    // * @Note: settings.outputDirs.add(src, out) seems cannot resolve symbols in other source files, why?
+    // @Note: settings.outputDirs.add(src, out) seems cannot resolve symbols in other source files, why?
     /*_
      for ((src, out) <- if (forTest) dirs.scalaTestSrcOutDirs else dirs.scalaSrcOutDirs) {
      settings.outputDirs.add(src, out)
@@ -339,7 +364,10 @@ object ScalaGlobal {
 
     // ----- now, the new global
 
-    val global = new ScalaGlobal(settings, dummyReporter)
+    // Setter of Global.reporter is useless due to interative.Global's direct reference
+    // to the constructor's param reporter, so we have to make sure only one reporter
+    // is assigned to Global (during create new instance)
+    val global = new ScalaGlobal(settings, new ErrorReporter)
     globals(idx) = global
 
     // * listen to compCp's change
@@ -350,26 +378,27 @@ object ScalaGlobal {
     }
    
     if (!forDebug) {
-      // * we have to do following step to get mixed java sources visible to scala sources
+      // we have to do following step to get mixed java sources visible to scala sources
       if (srcCp != null) {
         val srcCpListener = new SrcCpListener(global, srcCp)
         globalToListeners += (global -> (srcCpListener :: globalToListeners.getOrElse(global, Nil)))
         project.getProjectDirectory.getFileSystem.addFileChangeListener(srcCpListener)
 
-        // * should push java srcs before scala srcs
+        // should push java srcs before scala srcs
         val javaSrcs = new ArrayBuffer[FileObject]
         srcCp.getRoots foreach {x => findAllSourcesOf("text/x-java", x, javaSrcs)}
 
         val scalaSrcs = new ArrayBuffer[FileObject]
-        // * push scala src files to get classes that with different name from file name to be recognized properly
+        // push scala src files to get classes that with different name from file name to be recognized properly
         srcCp.getRoots foreach {x => findAllSourcesOf("text/x-scala", x, scalaSrcs)}
 
-        // * the reporter should be set, otherwise, no java source is resolved, maybe throws exception already.
-        global.reporter = dummyReporter
+        // the reporter should be set, otherwise, no java source is resolved, maybe throws exception already.
         global askForReLoad (javaSrcs ++= scalaSrcs).toList
       }
     }
 
+    logger.info("Project's global.settings: " + global.settings)
+    
     global
   }
 
@@ -386,10 +415,10 @@ object ScalaGlobal {
 
     val sources = ProjectUtils.getSources(project)
     val scalaSgs = sources.getSourceGroups(ScalaSourceUtil.SOURCES_TYPE_SCALA)
-    val javaSgs  = sources.getSourceGroups(ScalaSourceUtil.SOURCES_TYPE_JAVA)
+    val javaSgs = sources.getSourceGroups(ScalaSourceUtil.SOURCES_TYPE_JAVA)
 
-    logger.info((scalaSgs map (_.getRootFolder)).mkString("project's src group[ScalaType] dir: [", ", ", "]"))
-    logger.info((javaSgs  map (_.getRootFolder)).mkString("project's src group[JavaType]  dir: [", ", ", "]"))
+    logger.fine((scalaSgs map (_.getRootFolder.getPath)).mkString("Project's src group[ScalaType] dir: [", ", ", "]"))
+    logger.fine((javaSgs  map (_.getRootFolder.getPath)).mkString("Project's src group[JavaType]  dir: [", ", ", "]"))
 
     List(scalaSgs, javaSgs) foreach {
       case Array(srcSg) =>
@@ -416,7 +445,7 @@ object ScalaGlobal {
   private def findOutDir(project: Project, srcRoot: FileObject): FileObject = {
     val srcRootUrl: URL =
       try {
-        // * make sure the url is in same form of BinaryForSourceQueryImplementation
+        // make sure the url is in same form of BinaryForSourceQueryImplementation
         FileUtil.toFile(srcRoot).toURI.toURL
       } catch {case ex: MalformedURLException => Exceptions.printStackTrace(ex); null}
 
@@ -468,7 +497,7 @@ object ScalaGlobal {
       }
     }
 
-    // * global requires an exist out path, so we have to create a tmp folder
+    // global requires an exist out path, so we have to create a tmp folder
     if (out == null) {
       val projectDir = project.getProjectDirectory
       if (projectDir != null && projectDir.isFolder) {
@@ -522,7 +551,6 @@ object ScalaGlobal {
     override def fileDataCreated(fe: FileEvent): Unit = {
       val fo = fe.getFile
       if (fo.getMIMEType == javaMimeType && isUnderSrcDir(fo) && global != null) {
-        global.reporter = dummyReporter
         global askForReLoad List(fo)
       }
     }
@@ -530,7 +558,6 @@ object ScalaGlobal {
     override def fileChanged(fe: FileEvent): Unit = {
       val fo = fe.getFile
       if (fo.getMIMEType == javaMimeType && isUnderSrcDir(fo) && global != null) {
-        global.reporter = dummyReporter
         global askForReLoad List(fo)
       }
     }
@@ -538,7 +565,6 @@ object ScalaGlobal {
     override def fileRenamed(fe: FileRenameEvent): Unit = {
       val fo = fe.getFile
       if (fo.getMIMEType == javaMimeType && isUnderSrcDir(fo) && global != null) {
-        global.reporter = dummyReporter
         global askForReLoad List(fo)
       }
     }
@@ -600,27 +626,45 @@ object ScalaGlobal {
   }
 }
 
-class ScalaGlobal(_settings: Settings, _reporter: Reporter) extends Global(_settings, _reporter)
-                                                               with ScalaItems
-                                                               with ScalaDfns
-                                                               with ScalaRefs
-                                                               with ScalaElements
-                                                               with JavaElements
-                                                               with ScalaUtils {
+class ScalaGlobal(_settings: Settings, _reporter: Reporter, projectName: String = "") extends Global(_settings, _reporter, projectName)
+                                                                                         with ScalaItems
+                                                                                         with ScalaDfns
+                                                                                         with ScalaRefs
+                                                                                         with ScalaElements
+                                                                                         with JavaElements
+                                                                                         with ScalaUtils {
   import ScalaGlobal._
 
-  // * Inner object inside a class is not singleton, so it's safe for each instance of ScalaGlobal,
-  // * but, is it thread safe? http://lampsvn.epfl.ch/trac/scala/ticket/1591
+  override def forInteractive = true
+
+  override def logError(msg: String, t: Throwable): Unit = {}
+
+  private val log1 = Logger.getLogger(this.getClass.getName)
+  
+  // Inner object inside a class is not singleton, so it's safe for each instance of ScalaGlobal,
+  // but, is it thread safe? http://lampsvn.epfl.ch/trac/scala/ticket/1591
   private object scalaAstVisitor extends {
     val global: ScalaGlobal.this.type = ScalaGlobal.this
   } with ScalaAstVisitor
 
-  override def onlyPresentation = true
+  private var workingSource: Option[SourceFile] = None
+  private var isCancelingSemantic = false
 
-  override def logError(msg: String, t: Throwable): Unit = {}
-
-  def askForReLoad(srcFos: List[FileObject]) : Unit = {
-    val srcFiles = srcFos map {fo => getSourceFile(new PlainFile(FileUtil.toFile(fo)))}
+  private def resetReporter {
+    this.reporter match {
+      case x: ErrorReporter => x.reset
+      case _ =>
+    }
+  }
+  
+  def askForReLoad(srcFos: List[FileObject]) {
+    resetReporter
+    
+    val srcFiles = srcFos map {fo =>
+      val sourceFile = ScalaSourceFile.sourceFileOf(fo)
+      sourceFile.refreshSnapshot
+      sourceFile
+    }
 
     try {
       val resp = new Response[Unit]
@@ -639,12 +683,43 @@ class ScalaGlobal(_settings: Settings, _reporter: Reporter) extends Global(_sett
     }
   }
 
-  def askForSemantic(srcFile: SourceFile, forceReload: Boolean, th: TokenHierarchy[_]): ScalaRootScope = {
+  def askForType(source: ScalaSourceFile, forceReload: Boolean) {
+    try {
+      val typeResp = new Response[Tree]
+      askType(source, forceReload, typeResp)
+      typeResp.get
+    } catch {
+      case ex: AssertionError =>
+        /**
+         * @Note: avoid scala nsc's assert error. Since global's
+         * symbol table may have been broken, we have to reset ScalaGlobal
+         * to clean this global
+         */
+        ScalaGlobal.resetLate(this, ex)
+      case ex: java.lang.Error => // avoid scala nsc's Error error
+      case ex: Throwable => // just ignore all ex
+    }
+  }
+  
+  def askForSemantic(source: ScalaSourceFile, forceReload: Boolean): ScalaRootScope = {
+    resetReporter
+    
+    workingSource = Some(source)
+    isCancelingSemantic = false
+
     qualToRecoveredType = Map()
 
-    val resp = new Response[ScalaRootScope]
+    val response = new Response[ScalaRootScope]
     try {
-      askSemantic(srcFile, forceReload, resp, th)
+      if (isCancelingSemantic) return ScalaRootScope.EMPTY
+      val typeResp = new Response[Tree]
+      askType(source, forceReload, typeResp)
+
+      if (isCancelingSemantic) return ScalaRootScope.EMPTY
+      typeResp.get
+
+      if (isCancelingSemantic) return ScalaRootScope.EMPTY
+      askSemantic(source, response)
     } catch {
       case ex: AssertionError =>
         /**
@@ -657,57 +732,54 @@ class ScalaGlobal(_settings: Settings, _reporter: Reporter) extends Global(_sett
       case ex: Throwable => // just ignore all ex
     }
 
-    resp.get.left.toOption getOrElse ScalaRootScope.EMPTY
+    val res = response.get.left.toOption getOrElse ScalaRootScope.EMPTY
+    workingSource = None
+    res
   }
 
-  def askSemantic(source: SourceFile, forceReload: Boolean, result: Response[ScalaRootScope], th: TokenHierarchy[_]) =
-    scheduler postWorkItem new WorkItem(List(source)) {
-      def apply() = getSemanticRoot(source, forceReload, result, th)
-      override def toString = "semantic"
-    }
-
-  def getSemanticRoot(source : SourceFile, forceReload: Boolean, result: Response[ScalaRootScope], th: TokenHierarchy[_]) {
-    respond(result)(semanticRoot(source, forceReload, th))
+  private def askSemantic(source: ScalaSourceFile, response: Response[ScalaRootScope]) = {
+    scheduler postWorkItem AskSemanticItem(source, response)
   }
 
-  private var semanticCancelled = false
-  def semanticRoot(source: SourceFile, forceReload: Boolean, th: TokenHierarchy[_]): ScalaRootScope = {
-    semanticCancelled = false
-    val unit = unitOf(source)
-    val sources = List(source)
-    if (unit.status == NotLoaded || forceReload) reloadSources(sources)
-    moveToFront(sources)
-
-    if (semanticCancelled) return ScalaRootScope.EMPTY
-
-    currentTyperRun.typedTree(unitOf(source))
-
-    if (semanticCancelled) return ScalaRootScope.EMPTY
-
+  private def getSemantic(source: ScalaSourceFile, response: Response[ScalaRootScope]) {
+    respond(response)(semanticRoot(source))
+  }
+  
+  private def semanticRoot(source: ScalaSourceFile): ScalaRootScope = {
     val start = System.currentTimeMillis
-    val root = scalaAstVisitor(unitOf(source), th)
-    GlobalLog.info("Visit took " + (System.currentTimeMillis - start) + "ms")
-    root
+    getUnitOf(source) match {
+      case Some(unit) => 
+        val root = scalaAstVisitor(unit, source.tokenHierarchy)
+        log1.info("Visited " + source.file.file.getName + " in " + (System.currentTimeMillis - start) + "ms")
+        root
+      case None => ScalaRootScope.EMPTY
+    }
   }
 
-  def cancelSemantic(source: SourceFile) {
-    currentAction match {
-      case workItem: WorkItem if workItem.toString.startsWith("semantic") =>
-        val fileA = workItem.sources.head.file.file
+  /**
+   * @return will cancel
+   */
+  def cancelSemantic(source: SourceFile): Boolean = {
+    workingSource match {
+      case Some(x) =>
+        val fileA = x.file.file
         val fileB = source.file.file
         if (fileA != null && fileB != null && fileA.getAbsolutePath == fileB.getAbsolutePath) {
-          GlobalLog.info("CancelSemantic " + fileA.getName)
-          semanticCancelled = true
+          log1.info("Cancel semantic " + fileA.getName)
+          isCancelingSemantic = true
           scalaAstVisitor.cancel
-        }
-      case _ =>
+          true
+        } else false
+      case _ => false
     }
   }
 
   // ----- Code that has been deprecated, for reference only
   
   /** batch complie */
-  def compileSourcesForPresentation(srcFiles: List[FileObject]): Unit = {
+  def compileSourcesForPresentation(srcFiles: List[FileObject]) {
+    resetReporter
+    
     settings.stop.value = Nil
     settings.stop.tryToSetColon(List(superAccessors.phaseName))
     try {
@@ -725,17 +797,19 @@ class ScalaGlobal(_settings: Settings, _reporter: Reporter) extends Global(_sett
     }
   }
 
-  def compileSourceForPresentation(srcFile: SourceFile, th: TokenHierarchy[_]): ScalaRootScope = {
-    compileSource(srcFile, superAccessors.phaseName, th)
+  def compileSourceForPresentation(srcFile: ScalaSourceFile): ScalaRootScope = {
+    compileSource(srcFile, superAccessors.phaseName)
   }
 
   // * @Note Should pass phase "lambdalift" to get anonfun's class symbol built
-  def compileSourceForDebug(srcFile: SourceFile, th: TokenHierarchy[_]): ScalaRootScope = {
-    compileSource(srcFile, constructors.phaseName, th)
+  def compileSourceForDebug(srcFile: ScalaSourceFile): ScalaRootScope = {
+    compileSource(srcFile, constructors.phaseName)
   }
 
   // * @Note the following setting exlcudes 'stopPhase' itself
-  def compileSource(srcFile: SourceFile, stopPhaseName: String, th: TokenHierarchy[_]): ScalaRootScope = synchronized {
+  def compileSource(srcFile: ScalaSourceFile, stopPhaseName: String): ScalaRootScope = synchronized {
+    resetReporter
+    
     settings.stop.value = Nil
     settings.stop.tryToSetColon(List(stopPhaseName))
     qualToRecoveredType = Map()
@@ -768,9 +842,13 @@ class ScalaGlobal(_settings: Settings, _reporter: Reporter) extends Global(_sett
           })
       }
 
-      scalaAstVisitor(unit, th)
+      scalaAstVisitor(unit, srcFile.tokenHierarchy)
     } getOrElse ScalaRootScope.EMPTY
   }
 
-
+  case class AskSemanticItem(source: ScalaSourceFile, response: Response[ScalaRootScope]) extends WorkItem {
+    def apply() = getSemantic(source, response)
+    override def toString = "semantic " + source
+  }
+  
 }

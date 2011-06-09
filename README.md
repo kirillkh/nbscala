@@ -8,7 +8,7 @@ NetBeans Plugin for Scala
 
 # Setting nb.installation property for maven
 
-You should set 'nb.installtion' property in your maven settings.xml (.m2/settings.xml) to point to an existed NetBeans installation home, for example:
+You should set 'nb.installation' property in your maven settings.xml (.m2/settings.xml) to point to an existed NetBeans installation home, for example:
 
     <profiles>
         <profile>
@@ -36,3 +36,18 @@ Note: If you are using NetBeans 7.0 and build this project in NetBeans, you shou
 
 the nbms and update site can be found at nbscala/target/netbeans_site
 
+# Run/Debug ide:
+    cd nbscala
+    mvn nbm:cluster
+
+To run:
+
+    mvn nbm:run-ide
+
+To debug:
+
+    mvn nbm:run-ide -Pdebug-ide
+
+# Download built package
+
+    http://sourceforge.net/projects/erlybird/files/nb-scala/

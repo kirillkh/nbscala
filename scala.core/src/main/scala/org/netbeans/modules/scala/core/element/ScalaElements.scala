@@ -39,20 +39,18 @@
 
 package org.netbeans.modules.scala.core.element
 
-import java.io.{File, IOException}
+import java.io.IOException
 import javax.lang.model.element.Element
 import javax.swing.Icon
 import javax.swing.text.BadLocationException
-import org.netbeans.api.lexer.TokenHierarchy
 import org.netbeans.editor.BaseDocument
 import org.netbeans.modules.csl.api.{ElementHandle, ElementKind, Modifier, OffsetRange, HtmlFormatter}
 import org.netbeans.modules.csl.api.UiUtils
 import org.netbeans.modules.csl.spi.{GsfUtilities, ParserResult}
+import org.netbeans.modules.scala.core.ScalaSourceFile
 import org.openide.filesystems.{FileObject}
 import org.openide.util.Exceptions
 
-import scala.tools.nsc.io.{PlainFile, VirtualFile}
-import scala.tools.nsc.util.BatchSourceFile
 import scala.tools.nsc.symtab.{Flags}
 
 import org.netbeans.api.language.util.ast.{AstElementHandle}
@@ -217,25 +215,16 @@ trait ScalaElements {self: ScalaGlobal =>
       }
     }
 
-    private def load: Unit = {
+    private def load {
       if (isLoaded) return
 
       if (isJava) {
         javaElement = JavaSourceUtil.getJavaElement(JavaSourceUtil.getCompilationInfoForScalaFile(parserResult.getSnapshot.getSource.getFileObject), symbol)
       } else {
-        getDoc foreach {srcDoc =>
-          assert(path != null)
+        val fo = getFileObject 
+        if (fo != null) {
+          val srcFile = ScalaSourceFile.sourceFileOf(fo)
           try {
-            val text = srcDoc.getChars(0, srcDoc.getLength)
-            val f = new File(path)
-            val af = if (f != null) new PlainFile(f) else new VirtualFile("<current>", "")
-            val srcFile = new BatchSourceFile(af, text)
-
-            val th = TokenHierarchy.get(srcDoc)
-            if (th == null) {
-              return
-            }
-
             /**
              * @Note by compiling the related source file, this symbol will
              * be automatically loaded next time, but the position/sourcefile
@@ -243,14 +232,13 @@ trait ScalaElements {self: ScalaGlobal =>
              * position via the AST Tree, or use a tree visitor to update
              * all symbols Position
              */
-            val root = askForSemantic(srcFile, true, th)
+            val root = askForSemantic(srcFile, true)
             root.findDfnMatched(symbol) match {
-              case Some(x) => offset = x.idOffset(th)
+              case Some(x) => offset = x.idOffset(srcFile.tokenHierarchy)
               case None =>
             }
           } catch {case ex: BadLocationException => Exceptions.printStackTrace(ex)}
-                
-        }
+        }  
       }
 
       loaded = true
